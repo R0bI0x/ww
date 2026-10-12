@@ -1,0 +1,70 @@
+name: LLM API Server
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Auto-restart tiap 5 jam (runner max 6 jam)
+    - cron: "0 */5 * * *"
+
+jobs:
+  run-llm-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # < 6 jam (limit GitHub)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama & pull model
+        run: |
+          ollama serve &
+          sleep 5
+          # Model kecil agar muat di runner (7GB RAM / 14GB disk)
+          ollama pull llama3.2:1b
+          ollama list
+
+      - name: Download cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Start API server
+        env:
+          MODEL: llama3.2:1b
+          OLLAMA_URL: http://127.0.0.1:11434
+        run: |
+          uvicorn server.main:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
+          sleep 3
+          curl -s http://127.0.0.1:8000/health || true
+
+      - name: Expose via cloudflared tunnel
+        run: |
+          ./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate > tunnel.log 2>&1 &
+          sleep 15
+          echo "===== PUBLIC URL ====="
+          grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -n1 || \
+            (echo "URL belum muncul, cek tunnel.log"; cat tunnel.log)
+          echo "======================"
+
+      - name: Keep alive & show logs
+        run: |
+          echo "Server berjalan. URL di atas valid sampai job berakhir."
+          # Jaga job tetap hidup sampai timeout
+          for i in $(seq 1 340); do
+            sleep 60
+            echo "[$i min] still alive"
+          done
