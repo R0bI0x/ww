@@ -1,0 +1,110 @@
+name: Hermes Agent API Server (No Auth)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model Ollama (contoh: qwen2.5:7b, mistral:7b, llama3.1:8b)"
+        type: string
+        default: "qwen2.5:7b"
+  schedule:
+    - cron: "0 */5 * * *"
+
+jobs:
+  run-hermes-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      MODEL_NAME: ${{ github.event.inputs.model || 'qwen2.5:7b' }}
+      OLLAMA_URL: http://127.0.0.1:11434
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama & pull model
+        run: |
+          ollama serve > ollama.log 2>&1 &
+          sleep 8
+          echo "⏳ Mengunduh $MODEL_NAME (bisa 2-3 menit)..."
+          ollama pull "$MODEL_NAME"
+          ollama list
+
+      - name: Install Hermes Agent
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash || \
+            echo "⚠️  Installer Hermes gagal, lanjut tanpa Hermes (wrapper tetap jalan)"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.hermes/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Hermes config
+        run: |
+          mkdir -p ~/.hermes
+          cp hermes/config.toml ~/.hermes/config.toml
+          hermes model set ollama:"$MODEL_NAME" || true
+          hermes doctor || true
+
+      - name: Start Hermes gateway (opsional)
+        continue-on-error: true
+        run: |
+          hermes gateway > hermes.log 2>&1 &
+          for i in $(seq 1 15); do
+            curl -sf http://127.0.0.1:8642/v1/models \
+              -H "Authorization: Bearer no-auth-needed" >/dev/null && break
+            sleep 2
+          done
+          tail -30 hermes.log || true
+
+      - name: Start wrapper API
+        run: |
+          uvicorn server.api_wrapper:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
+          sleep 3
+          curl -s http://127.0.0.1:8000/health || true
+
+      - name: Install cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Open tunnel & print URL
+        run: |
+          ./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate > tunnel.log 2>&1 &
+          sleep 15
+          URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -n1)
+          echo ""
+          echo "=================================================="
+          echo "  🌐 PUBLIC URL : $URL"
+          echo "  💬 Chat       : POST $URL/chat"
+          echo "  🤖 OpenAI API : POST $URL/v1/chat/completions"
+          echo "  ❤️  Health    : GET  $URL/health"
+          echo "  🧠 Model      : $MODEL_NAME"
+          echo "  🔓 Auth       : TIDAK PERLU"
+          echo "=================================================="
+          echo ""
+          echo "Test cepat:"
+          echo "curl -X POST $URL/chat -H 'Content-Type: application/json' \\"
+          echo "  -d '{\"prompt\":\"Halo, siapa kamu?\"}'"
+
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 340); do
+            sleep 60
+            echo "[$i min] alive — $MODEL_NAME"
+          done
