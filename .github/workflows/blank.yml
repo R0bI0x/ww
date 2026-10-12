@@ -1,4 +1,4 @@
-#.github/workflows/main.yml
+# .github/workflows/main.yml
 name: Windows - Ngrok
 
 on: workflow_dispatch
@@ -15,7 +15,7 @@ env:
 jobs:
   ngrok-rdp:
     runs-on: windows-latest
-    timeout-minutes: 9999
+    timeout-minutes: 360
 
     steps:
     - name: Setup Windows Remote Desktop
@@ -42,11 +42,12 @@ jobs:
         w32tm /config /manualpeerlist:"time.windows.com" /syncfromflags:manual /reliable:yes /update *>$null
         
         diskperf -Y *>$null
-        "$env:TEMP\*" | Remove-Item -Recurse -Force
-        "C:\Windows\Temp\*" | Remove-Item -Recurse -Force
-        "C:\Windows\Prefetch\*" | Remove-Item -Recurse -Force
-        "C:\Users\Public\Desktop\*" | Remove-Item -Recurse -Force
-        (New-Object -ComObject Shell.Application).Namespace(0xA).Items() | %{Remove-Item $_.Path -Recurse -Confirm:$false}
+
+        Get-ChildItem "$env:TEMP\*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem "C:\Windows\Temp\*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem "C:\Windows\Prefetch\*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem "C:\Users\Public\Desktop\*" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        (New-Object -ComObject Shell.Application).Namespace(0xA).Items() | ForEach-Object { Remove-Item $_.Path -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue }
         (New-Object -ComObject Shell.Application).minimizeall()
         
     - name: Install and Configure Ngrok
@@ -100,7 +101,7 @@ jobs:
             
           } else {
             Write-Host "Connection test failed. Retrying..."
-            Get-Process ngrok | Stop-Process -Force
+            Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
             $retryCount++
             Start-Sleep -Seconds 5
           }
