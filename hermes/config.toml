@@ -1,0 +1,14 @@
+[agent]
+name = "gha-hermes"
+memory_backend = "sqlite"
+
+[api_server]
+enabled = true
+host = "127.0.0.1"
+port = 8642
+api_key = "no-auth-needed"   # dummy, tidak dipakai karena semua request internal
+
+[providers.ollama]
+type = "openai"
+base_url = "http://127.0.0.1:11434/v1"
+api_key = "ollama"           # dummy — Ollama tidak butuh key
