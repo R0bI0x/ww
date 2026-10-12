@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       duration_hours:
-        description: 'Durasi sesi (jam)'
+        description: 'Durasi sesi (jam, max 6)'
         required: true
         default: '6'
         type: string
@@ -28,7 +28,7 @@ env:
   NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
   DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
   RDP_USER: admin
-  RDP_PASS: ${{ secrets.RDP_PASS || 'p@ssw0rd!' }}
+  RDP_PASS: ${{ secrets.RDP_PASS }}
   DURATION_HOURS: ${{ inputs.duration_hours }}
   ENABLE_HTTP_TUNNEL: ${{ inputs.enable_http_tunnel }}
   NOTIFY_DISCORD: ${{ inputs.notify_discord }}
@@ -39,49 +39,51 @@ jobs:
     timeout-minutes: 360
 
     steps:
-    # ============================================================
-    # STEP 1: Validasi Konfigurasi & Pre-flight Checks
-    # ============================================================
     - name: Validate Configuration
+      shell: pwsh
       run: |
         Write-Host "::group::Validasi Konfigurasi"
-        
+
+        if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
+          "RDP_PASS=p@ssw0rd!" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $env:RDP_PASS = "p@ssw0rd!"
+          Write-Host "RDP_PASS tidak di-set, pakai default."
+        }
+
         $errors = @()
-        
+
         if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
           $errors += "NGROK_AUTH_TOKEN tidak di-set di Secrets!"
         }
-        
+
         if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
           $errors += "RDP_PASS kosong!"
         }
-        
+
         $dur = [int]$env:DURATION_HOURS
         if ($dur -lt 1 -or $dur -gt 6) {
           Write-Host "::warning::Durasi $dur jam di luar rentang 1-6 jam. Akan di-clamp ke 6 jam."
           $dur = [math]::Min([math]::Max($dur, 1), 6)
           "DURATION_HOURS=$dur" | Out-File -FilePath $env:GITHUB_ENV -Append
         }
-        
+
         Write-Host "Runner OS       : $env:RUNNER_OS"
         Write-Host "Runner Arch     : $env:RUNNER_ARCH"
         Write-Host "RDP User        : $env:RDP_USER"
         Write-Host "Durasi          : $dur jam"
         Write-Host "HTTP Tunnel     : $env:ENABLE_HTTP_TUNNEL"
         Write-Host "Notif Discord   : $env:NOTIFY_DISCORD"
-        
+
         if ($errors.Count -gt 0) {
           foreach ($e in $errors) { Write-Host "::error::$e" }
           exit 1
         }
-        
+
         Write-Host "Validasi berhasil."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 2: Optimasi Sistem & Info
-    # ============================================================
-    - name: System Optimization & Info
+    - name: System Optimization and Info
+      shell: pwsh
       run: |
         Write-Host "::group::Informasi Sistem"
         Write-Host "OS          : $((Get-CimInstance Win32_OperatingSystem).Caption)"
@@ -92,11 +94,9 @@ jobs:
         Write-Host "::endgroup::"
 
         Write-Host "::group::Optimasi Sistem"
-        # Matikan update otomatis agar tidak mengganggu sesi
         Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
         Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue
 
-        # Matikan Windows Defender realtime (opsional, untuk performa)
         try {
           Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
           Write-Host "Windows Defender realtime protection dimatikan."
@@ -104,23 +104,19 @@ jobs:
           Write-Host "Tidak bisa mematikan Defender (mungkin diproteksi)."
         }
 
-        # Set power plan ke High Performance
         powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
         Write-Host "Power plan diset ke High Performance."
 
-        # Matikan hibernasi
         powercfg /hibernate off 2>$null
         Write-Host "Hibernasi dimatikan."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 3: Setup Windows Remote Desktop
-    # ============================================================
     - name: Setup Windows Remote Desktop
+      shell: pwsh
       run: |
         Write-Host "::group::Setup RDP"
         Write-Host "::add-mask::$env:RDP_PASS"
-        
+
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
@@ -129,7 +125,6 @@ jobs:
           Write-Host "Warning: Menggunakan default user account!"
           Set-LocalUser -Name $env:RDP_USER -Password (ConvertTo-SecureString "$env:RDP_PASS" -AsPlainText -Force)
         } else {
-          # Cek apakah user sudah ada
           $existingUser = Get-LocalUser -Name "$env:RDP_USER" -ErrorAction SilentlyContinue
           if ($existingUser) {
             Write-Host "User $env:RDP_USER sudah ada, update password."
@@ -141,21 +136,18 @@ jobs:
             Write-Host "User $env:RDP_USER dibuat dan ditambahkan ke Administrators."
           }
         }
-        
+
         icacls "C:\Windows\Temp" /grant "$env:RDP_USER`:F" *>$null
         icacls "C:\Windows\installer" /grant "$env:RDP_USER`:F" *>$null
 
-        # Set RDP session timeout jadi tidak terbatas
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxIdleTime" -Value 0 -ErrorAction SilentlyContinue
         Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxDisconnectionTime" -Value 0 -ErrorAction SilentlyContinue
 
         Write-Host "Setup RDP selesai."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 4: Sinkronisasi Waktu
-    # ============================================================
     - name: Time Synchronization
+      shell: pwsh
       run: |
         Write-Host "::group::Sinkronisasi Waktu"
         Set-Service -Name "W32Time" -StartupType Automatic -ErrorAction Stop *>$null
@@ -168,44 +160,39 @@ jobs:
         Write-Host "Waktu sistem: $time"
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 5: Cleanup Temp Files (Aman)
-    # ============================================================
     - name: Cleanup Temp Files
+      shell: pwsh
       run: |
         Write-Host "::group::Cleanup Temp Files"
-        
+
         $paths = @(
           "$env:TEMP\*",
           "C:\Windows\Temp\*",
           "C:\Windows\Prefetch\*",
           "C:\Users\Public\Desktop\*"
         )
-        
+
         foreach ($p in $paths) {
           Write-Host "Membersihkan $p ..."
           Get-ChildItem $p -ErrorAction SilentlyContinue |
             Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         }
-        
-        # Cleanup Recent items
+
         (New-Object -ComObject Shell.Application).Namespace(0xA).Items() |
           ForEach-Object { Remove-Item $_.Path -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue }
-        
+
         (New-Object -ComObject Shell.Application).minimizeall()
-        
+
         diskperf -Y *>$null
         Write-Host "Cleanup selesai."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 6: Install Ngrok
-    # ============================================================
     - name: Install and Configure Ngrok
+      shell: pwsh
       run: |
         Write-Host "::group::Instalasi Ngrok"
         Write-Host "::add-mask::$env:NGROK_AUTH_TOKEN"
-        
+
         Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
         Expand-Archive ngrok.zip -DestinationPath .\ngrok -Force
 
@@ -218,29 +205,24 @@ jobs:
           Write-Host "::error::Autentikasi ngrok gagal! Periksa NGROK_AUTH_TOKEN."
           exit 1
         }
-        
+
         Write-Host "Autentikasi ngrok berhasil."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 7: Konfigurasi Firewall
-    # ============================================================
     - name: Allow Ngrok Through Firewall
+      shell: pwsh
       run: |
         Write-Host "::group::Konfigurasi Firewall"
         $ngrokPath = "$PWD\ngrok\ngrok.exe"
-        
+
         New-NetFirewallRule -DisplayName "Allow Ngrok Outbound" -Direction Outbound -Program $ngrokPath -Action Allow -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName "Allow Ngrok Inbound" -Direction Inbound -Program $ngrokPath -Action Allow -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName "Allow RDP 3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
-        
+
         Write-Host "Firewall rules ditambahkan."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 8: Start Ngrok Tunnel (TCP untuk RDP)
-    # ============================================================
-    - name: Start Ngrok TCP Tunnel (RDP)
+    - name: Start Ngrok TCP Tunnel
       id: rdp_tunnel
       shell: pwsh
       run: |
@@ -258,11 +240,7 @@ jobs:
           Start-Sleep -Seconds 2
 
           Write-Host "Menjalankan ngrok tunnel tcp 3389..."
-          $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=stdout --log-format=logfmt" `
-            -WindowStyle Hidden -PassThru `
-            -RedirectStandardOutput "ngrok_log.txt" `
-            -RedirectStandardError "ngrok_err.txt"
+          $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout --log-format=logfmt" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok_log.txt" -RedirectStandardError "ngrok_err.txt"
 
           Start-Sleep -Seconds 10
 
@@ -315,8 +293,6 @@ jobs:
             $rdpInfo = @{
               Host = $address
               Port = $port
-              User = $env:RDP_USER
-              Pass = $env:RDP_PASS
             }
             Write-Host "Koneksi RDP berhasil!"
           } else {
@@ -332,37 +308,28 @@ jobs:
           exit 1
         }
 
-        # Simpan ke output
         "RDP_HOST=$($rdpInfo.Host)" | Out-File -FilePath $env:GITHUB_ENV -Append
         "RDP_PORT=$($rdpInfo.Port)" | Out-File -FilePath $env:GITHUB_ENV -Append
         "RDP_FULL_ADDRESS=$($rdpInfo.Host):$($rdpInfo.Port)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-        
+
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 9: HTTP Tunnel untuk File Sharing (Opsional)
-    # ============================================================
-    - name: Start Ngrok HTTP Tunnel (File Sharing)
+    - name: Start Ngrok HTTP Tunnel
       if: ${{ inputs.enable_http_tunnel }}
       id: http_tunnel
       shell: pwsh
       run: |
         Write-Host "::group::Start Ngrok HTTP Tunnel"
-        
-        # Buat folder untuk sharing
+
         $shareDir = "C:\RDP_Share"
         New-Item -ItemType Directory -Path $shareDir -Force | Out-Null
         "Selamat datang di RDP Share!" | Out-File "$shareDir\README.txt"
-        
-        # Start HTTP server sederhana dengan Python (built-in di runner)
+
         Write-Host "Membuat HTTP server di port 8080..."
-        $pythonProc = Start-Process -FilePath "python" `
-          -ArgumentList "-m http.server 8080 --directory `"$shareDir`"" `
-          -WindowStyle Hidden -PassThru
-        
+        $pythonProc = Start-Process -FilePath "python" -ArgumentList "-m http.server 8080 --directory `"$shareDir`"" -WindowStyle Hidden -PassThru
+
         Start-Sleep -Seconds 3
-        
-        # Buat tunnel HTTP via ngrok API (menambahkan tunnel kedua)
+
         Write-Host "Menambahkan HTTP tunnel via API ngrok..."
         $body = @{
           addr = "8080"
@@ -373,10 +340,10 @@ jobs:
         try {
           $null = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
           Start-Sleep -Seconds 5
-          
+
           $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
           $httpUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'http' }).public_url
-          
+
           if ($httpUrl) {
             "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
             "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -387,73 +354,66 @@ jobs:
         } catch {
           Write-Host "::warning::Gagal membuat HTTP tunnel: $($_.Exception.Message)"
         }
-        
+
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 10: Tampilkan Info Koneksi
-    # ============================================================
     - name: Display Connection Info
       shell: pwsh
       run: |
         Write-Host "::add-mask::$env:RDP_PASS"
         $sep = "=" * 60
         Write-Host $sep
-        Write-Host "  🖥️  WINDOWS RDP SIAP DIGUNAKAN"
+        Write-Host "  WINDOWS RDP SIAP DIGUNAKAN"
         Write-Host $sep
         Write-Host "  Host         : $env:RDP_HOST"
         Write-Host "  Port         : $env:RDP_PORT"
         Write-Host "  Full Address : $env:RDP_FULL_ADDRESS"
         Write-Host "  Username     : $env:RDP_USER"
-        Write-Host "  Password     : (lihat log sebelumnya)"
-        
+        Write-Host "  Password     : $env:RDP_PASS"
+        Write-Host ""
+
         if ($env:HTTP_TUNNEL_URL) {
-          Write-Host ""
-          Write-Host "  📁 File Sharing (HTTP)"
+          Write-Host "  File Sharing (HTTP)"
           Write-Host "  URL          : $env:HTTP_TUNNEL_URL"
           Write-Host "  Folder       : C:\RDP_Share"
+          Write-Host ""
         }
-        
+
+        Write-Host "  Durasi       : $env:DURATION_HOURS jam"
         Write-Host ""
-        Write-Host "  ⏱️  Durasi     : $env:DURATION_HOURS jam"
-        Write-Host ""
-        Write-Host "  💡 Cara connect:"
+        Write-Host "  Cara connect:"
         Write-Host "     1. Buka Remote Desktop Client (mstsc)"
         Write-Host "     2. Masukkan: $env:RDP_FULL_ADDRESS"
         Write-Host "     3. Login dengan user: $env:RDP_USER"
         Write-Host $sep
 
-        # Simpan sebagai artifact
-        $info = @"
-============================================================
-WINDOWS RDP CONNECTION INFO
-============================================================
-Host         : $env:RDP_HOST
-Port         : $env:RDP_PORT
-Full Address : $env:RDP_FULL_ADDRESS
-Username     : $env:RDP_USER
-Password     : $env:RDP_PASS
-HTTP Tunnel  : $env:HTTP_TUNNEL_URL
-Duration     : $env:DURATION_HOURS jam
-Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-============================================================
-"@
-        $info | Out-File -FilePath "rdp-info.txt" -Encoding UTF8
+        $lines = @(
+          ("=" * 60),
+          "WINDOWS RDP CONNECTION INFO",
+          ("=" * 60),
+          "Host         : $env:RDP_HOST",
+          "Port         : $env:RDP_PORT",
+          "Full Address : $env:RDP_FULL_ADDRESS",
+          "Username     : $env:RDP_USER",
+          "Password     : $env:RDP_PASS",
+          "HTTP Tunnel  : $env:HTTP_TUNNEL_URL",
+          "Duration     : $env:DURATION_HOURS jam",
+          "Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+          ("=" * 60)
+        )
+        $lines -join "`n" | Out-File -FilePath "rdp-info.txt" -Encoding UTF8
 
-    # ============================================================
-    # STEP 11: Notifikasi Discord (Opsional)
-    # ============================================================
     - name: Send Discord Notification
       if: ${{ inputs.notify_discord && env.DISCORD_WEBHOOK != '' }}
       shell: pwsh
       run: |
         Write-Host "Mengirim notifikasi ke Discord..."
-        
+
         $payload = @{
           username = "RDP Bot"
           embeds = @(
             @{
-              title = "🖥️ Windows RDP Siap Digunakan"
+              title = "Windows RDP Siap Digunakan"
               color = 3066993
               fields = @(
                 @{ name = "Host"; value = "$env:RDP_HOST"; inline = $true },
@@ -474,9 +434,6 @@ Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
           Write-Host "::warning::Gagal kirim Discord: $($_.Exception.Message)"
         }
 
-    # ============================================================
-    # STEP 12: Upload Info sebagai Artifact
-    # ============================================================
     - name: Upload Connection Info
       uses: actions/upload-artifact@v4
       if: always()
@@ -485,15 +442,12 @@ Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         path: rdp-info.txt
         retention-days: 1
 
-    # ============================================================
-    # STEP 13: Keep Alive dengan Auto-Recovery
-    # ============================================================
     - name: Keep Alive
       shell: pwsh
       run: |
         Write-Host "::group::Keep Alive"
         $duration = ([int]$env:DURATION_HOURS) * 3600
-        $interval = 60    # Cek setiap 1 menit
+        $interval = 60
         $endTime = (Get-Date).AddSeconds($duration)
         $lastStatus = ""
 
@@ -502,26 +456,20 @@ Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
         while ((Get-Date) -lt $endTime) {
           $ngrokProcess = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
-          $pythonProcess = Get-Process -Name "python" -ErrorAction SilentlyContinue
-          
+
           if (-not $ngrokProcess) {
             Write-Host "::error::Proses ngrok mati! Mencoba restart..."
-            
-            # Coba restart ngrok
+
             try {
-              $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" `
-                -ArgumentList "tcp 3389 --log=stdout" `
-                -WindowStyle Hidden -PassThru `
-                -RedirectStandardOutput "ngrok_recover.txt" `
-                -RedirectStandardError "ngrok_recover_err.txt"
-              
+              $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok_recover.txt" -RedirectStandardError "ngrok_recover_err.txt"
+
               Start-Sleep -Seconds 15
-              
+
               if ($ngrokProc.HasExited) {
                 Write-Host "::error::Gagal restart ngrok. Keluar."
                 exit 1
               }
-              
+
               Write-Host "Ngrok berhasil di-restart. URL mungkin berubah!"
               $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
               $newUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' }).public_url
@@ -545,29 +493,26 @@ Generated    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         Write-Host "Durasi keep-alive selesai."
         Write-Host "::endgroup::"
 
-    # ============================================================
-    # STEP 14: Cleanup
-    # ============================================================
     - name: Cleanup
       if: always()
       shell: pwsh
       run: |
         Write-Host "::group::Cleanup"
-        
+
         Write-Host "Menghentikan proses ngrok..."
         Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        
+
         Write-Host "Menghentikan HTTP server..."
         Get-Process -Name "python" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        
+
         Write-Host "Menghapus file sementara..."
         Remove-Item "ngrok.zip","ngrok_log.txt","ngrok_err.txt","ngrok_recover.txt","ngrok_recover_err.txt" -Force -ErrorAction SilentlyContinue
         Remove-Item ".\ngrok" -Recurse -Force -ErrorAction SilentlyContinue
-        
+
         Write-Host "Menghapus firewall rules..."
         Remove-NetFirewallRule -DisplayName "Allow Ngrok Outbound" -ErrorAction SilentlyContinue
         Remove-NetFirewallRule -DisplayName "Allow Ngrok Inbound" -ErrorAction SilentlyContinue
         Remove-NetFirewallRule -DisplayName "Allow RDP 3389" -ErrorAction SilentlyContinue
-        
+
         Write-Host "Cleanup selesai."
         Write-Host "::endgroup::"
