@@ -1,5 +1,5 @@
 # .github/workflows/main.yml
-name: Windows RDP via Ngrok - Advanced
+name: Windows RDP via bore.pub
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         default: '6'
         type: string
       enable_http_tunnel:
-        description: 'Aktifkan HTTP tunnel tambahan (untuk file sharing)'
+        description: 'Aktifkan HTTP tunnel tambahan (file sharing)'
         required: true
         default: true
         type: boolean
@@ -25,16 +25,16 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
   DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
   RDP_USER: admin
   RDP_PASS: ${{ secrets.RDP_PASS }}
   DURATION_HOURS: ${{ inputs.duration_hours }}
   ENABLE_HTTP_TUNNEL: ${{ inputs.enable_http_tunnel }}
   NOTIFY_DISCORD: ${{ inputs.notify_discord }}
+  BORE_SERVER: bore.pub
 
 jobs:
-  ngrok-rdp:
+  bore-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
 
@@ -50,35 +50,18 @@ jobs:
           Write-Host "RDP_PASS tidak di-set, pakai default."
         }
 
-        $errors = @()
-
-        if ([string]::IsNullOrWhiteSpace($env:NGROK_AUTH_TOKEN)) {
-          $errors += "NGROK_AUTH_TOKEN tidak di-set di Secrets!"
-        }
-
-        if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
-          $errors += "RDP_PASS kosong!"
-        }
-
         $dur = [int]$env:DURATION_HOURS
         if ($dur -lt 1 -or $dur -gt 6) {
-          Write-Host "::warning::Durasi $dur jam di luar rentang 1-6 jam. Akan di-clamp ke 6 jam."
+          Write-Host "::warning::Durasi $dur jam di luar rentang 1-6 jam. Di-clamp ke 6 jam."
           $dur = [math]::Min([math]::Max($dur, 1), 6)
           "DURATION_HOURS=$dur" | Out-File -FilePath $env:GITHUB_ENV -Append
         }
 
+        Write-Host "Tunnel service  : bore.pub (gratis, tanpa akun)"
         Write-Host "Runner OS       : $env:RUNNER_OS"
-        Write-Host "Runner Arch     : $env:RUNNER_ARCH"
         Write-Host "RDP User        : $env:RDP_USER"
         Write-Host "Durasi          : $dur jam"
         Write-Host "HTTP Tunnel     : $env:ENABLE_HTTP_TUNNEL"
-        Write-Host "Notif Discord   : $env:NOTIFY_DISCORD"
-
-        if ($errors.Count -gt 0) {
-          foreach ($e in $errors) { Write-Host "::error::$e" }
-          exit 1
-        }
-
         Write-Host "Validasi berhasil."
         Write-Host "::endgroup::"
 
@@ -88,7 +71,6 @@ jobs:
         Write-Host "::group::Informasi Sistem"
         Write-Host "OS          : $((Get-CimInstance Win32_OperatingSystem).Caption)"
         Write-Host "CPU         : $((Get-CimInstance Win32_Processor).Name)"
-        Write-Host "Cores       : $((Get-CimInstance Win32_Processor).NumberOfCores)"
         Write-Host "RAM         : $([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)) GB"
         Write-Host "Free Disk C : $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB"
         Write-Host "::endgroup::"
@@ -105,10 +87,8 @@ jobs:
         }
 
         powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-        Write-Host "Power plan diset ke High Performance."
-
         powercfg /hibernate off 2>$null
-        Write-Host "Hibernasi dimatikan."
+        Write-Host "Power plan High Performance + hibernasi mati."
         Write-Host "::endgroup::"
 
     - name: Setup Windows Remote Desktop
@@ -156,170 +136,164 @@ jobs:
         w32tm /config /manualpeerlist:"time.windows.com,time.google.com" /syncfromflags:manual /reliable:yes /update *>$null
         Restart-Service W32Time *>$null
         Start-Sleep -Seconds 3
-        $time = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        Write-Host "Waktu sistem: $time"
+        Write-Host "Waktu sistem: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
         Write-Host "::endgroup::"
 
     - name: Cleanup Temp Files
       shell: pwsh
       run: |
         Write-Host "::group::Cleanup Temp Files"
-
         $paths = @(
           "$env:TEMP\*",
           "C:\Windows\Temp\*",
           "C:\Windows\Prefetch\*",
           "C:\Users\Public\Desktop\*"
         )
-
         foreach ($p in $paths) {
-          Write-Host "Membersihkan $p ..."
-          Get-ChildItem $p -ErrorAction SilentlyContinue |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $p -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         }
-
         (New-Object -ComObject Shell.Application).Namespace(0xA).Items() |
           ForEach-Object { Remove-Item $_.Path -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue }
-
         (New-Object -ComObject Shell.Application).minimizeall()
-
         diskperf -Y *>$null
         Write-Host "Cleanup selesai."
         Write-Host "::endgroup::"
 
-    - name: Install and Configure Ngrok
+    - name: Download bore CLI
       shell: pwsh
       run: |
-        Write-Host "::group::Instalasi Ngrok"
-        Write-Host "::add-mask::$env:NGROK_AUTH_TOKEN"
+        Write-Host "::group::Download bore CLI"
+        # Ambil rilis terbaru via GitHub API (asset Windows x64)
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/ekzhang/bore/releases/latest" -Headers @{ "User-Agent" = "GitHubActions" }
+        Write-Host "Rilis terbaru: $($release.tag_name)"
 
-        Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
-        Expand-Archive ngrok.zip -DestinationPath .\ngrok -Force
-
-        Write-Host "Versi ngrok:"
-        .\ngrok\ngrok.exe --version
-
-        Write-Host "Konfigurasi authtoken..."
-        .\ngrok\ngrok.exe config add-authtoken $env:NGROK_AUTH_TOKEN
-        if ($LASTEXITCODE -ne 0) {
-          Write-Host "::error::Autentikasi ngrok gagal! Periksa NGROK_AUTH_TOKEN."
+        $asset = $release.assets | Where-Object { $_.name -match "x86_64-pc-windows-msvc\.zip$" } | Select-Object -First 1
+        if (-not $asset) {
+          Write-Host "::error::Asset Windows tidak ditemukan di rilis $($release.tag_name)."
           exit 1
         }
+        Write-Host "Mengunduh: $($asset.name)"
 
-        Write-Host "Autentikasi ngrok berhasil."
+        Invoke-WebRequest $asset.browser_download_url -OutFile "bore.zip"
+        Expand-Archive "bore.zip" -DestinationPath ".\bore" -Force
+
+        # Cari bore.exe (kadang ada di subfolder)
+        $boreExe = Get-ChildItem ".\bore" -Recurse -Filter "bore.exe" | Select-Object -First 1
+        if (-not $boreExe) {
+          Write-Host "::error::bore.exe tidak ditemukan setelah ekstrak."
+          exit 1
+        }
+        # Pindahkan ke root folder .\bore agar path konsisten
+        if ($boreExe.DirectoryName -ne (Resolve-Path ".\bore").Path) {
+          Move-Item $boreExe.FullName ".\bore\bore.exe" -Force
+        }
+
+        Write-Host "Versi bore:"
+        .\bore\bore.exe --version
         Write-Host "::endgroup::"
 
-    - name: Allow Ngrok Through Firewall
+    - name: Configure Firewall for bore
       shell: pwsh
       run: |
         Write-Host "::group::Konfigurasi Firewall"
-        $ngrokPath = "$PWD\ngrok\ngrok.exe"
-
-        New-NetFirewallRule -DisplayName "Allow Ngrok Outbound" -Direction Outbound -Program $ngrokPath -Action Allow -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName "Allow Ngrok Inbound" -Direction Inbound -Program $ngrokPath -Action Allow -ErrorAction SilentlyContinue
+        $borePath = "$PWD\bore\bore.exe"
+        New-NetFirewallRule -DisplayName "Allow bore Outbound" -Direction Outbound -Program $borePath -Action Allow -ErrorAction SilentlyContinue
+        New-NetFirewallRule -DisplayName "Allow bore Inbound" -Direction Inbound -Program $borePath -Action Allow -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName "Allow RDP 3389" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue
-
         Write-Host "Firewall rules ditambahkan."
         Write-Host "::endgroup::"
 
-    - name: Start Ngrok TCP Tunnel
+    # ============================================================
+    # Helper: jalankan bore dan parse port publik dari output
+    # bore menulis log ke stderr dengan format:
+    #   ... INFO bore_cli::client: listening on bore.pub:12345
+    # ============================================================
+    - name: Start bore TCP Tunnel for RDP
       id: rdp_tunnel
       shell: pwsh
       run: |
-        Write-Host "::group::Start Ngrok TCP Tunnel"
-        $maxRetries = 3
+        Write-Host "::group::Start bore TCP Tunnel (RDP)"
+        $maxRetries = 5
         $retryCount = 0
         $success = $false
-        $rdpInfo = @{}
+        $publicPort = $null
 
         while (-not $success -and $retryCount -lt $maxRetries) {
           Write-Host "--- Percobaan ke-$(($retryCount + 1)) dari $maxRetries ---"
 
-          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Remove-Item "ngrok_log.txt","ngrok_err.txt" -Force -ErrorAction SilentlyContinue
+          Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Remove-Item "bore_out.txt","bore_err.txt" -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 2
 
-          Write-Host "Menjalankan ngrok tunnel tcp 3389..."
-          $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout --log-format=logfmt" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok_log.txt" -RedirectStandardError "ngrok_err.txt"
+          Write-Host "Menjalankan: bore local 3389 --to $env:BORE_SERVER"
+          $boreProc = Start-Process -FilePath ".\bore\bore.exe" `
+            -ArgumentList "local 3389 --to $env:BORE_SERVER" `
+            -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput "bore_out.txt" `
+            -RedirectStandardError "bore_err.txt"
 
-          Start-Sleep -Seconds 10
+          # Tunggu bore konek dan print port (max 30 detik)
+          $wait = 0
+          while (-not $publicPort -and $wait -lt 30) {
+            Start-Sleep -Seconds 2
+            $wait += 2
 
-          if ($ngrokProc.HasExited) {
-            Write-Host "::error::Proses ngrok mati tak lama setelah dijalankan."
-            Write-Host "--- Log stdout ---"
-            Get-Content "ngrok_log.txt" -ErrorAction SilentlyContinue
-            Write-Host "--- Log stderr ---"
-            Get-Content "ngrok_err.txt" -ErrorAction SilentlyContinue
-            $retryCount++
-            Start-Sleep -Seconds 5
-            continue
-          }
+            if ($boreProc.HasExited) {
+              Write-Host "::warning::Proses bore mati (exit code $($boreProc.ExitCode))."
+              break
+            }
 
-          $attempts = 0
-          $maxAttempts = 10
-          $ngrokUrl = $null
+            $combined = ""
+            if (Test-Path "bore_out.txt") { $combined += (Get-Content "bore_out.txt" -Raw -ErrorAction SilentlyContinue) }
+            if (Test-Path "bore_err.txt") { $combined += (Get-Content "bore_err.txt" -Raw -ErrorAction SilentlyContinue) }
 
-          while (-not $ngrokUrl -and $attempts -lt $maxAttempts) {
-            Start-Sleep -Seconds 5
-            $attempts++
-            try {
-              $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10 -ErrorAction Stop
-              $ngrokUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' }).public_url
-              if ($ngrokUrl) {
-                Write-Host "URL ngrok diperoleh: $ngrokUrl"
-              }
-            } catch {
-              Write-Host "Percobaan $attempts`: Menunggu API ngrok... ($($_.Exception.Message))"
+            $m = [regex]::Match($combined, "bore\.pub:(\d+)")
+            if ($m.Success) {
+              $publicPort = $m.Groups[1].Value
             }
           }
 
-          if (-not $ngrokUrl) {
-            Write-Host "Gagal mendapatkan URL ngrok setelah $maxAttempts percobaan."
-            Get-Content "ngrok_log.txt" -ErrorAction SilentlyContinue
-            Get-Content "ngrok_err.txt" -ErrorAction SilentlyContinue
-            Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
-            $retryCount++
-            Start-Sleep -Seconds 5
-            continue
-          }
-
-          $cleanUrl = $ngrokUrl -replace "^tcp://", ""
-          $address, $port = $cleanUrl -split ":"
-          Write-Host "Menguji koneksi ke $address`:$port ..."
-          $testResult = Test-NetConnection -ComputerName $address -Port $port -WarningAction SilentlyContinue
-
-          if ($testResult.TcpTestSucceeded) {
+          if ($publicPort) {
             $success = $true
-            $rdpInfo = @{
-              Host = $address
-              Port = $port
+            Write-Host "Port publik diperoleh: $publicPort"
+
+            # Test koneksi ke port publik
+            Write-Host "Menguji koneksi ke $env:BORE_SERVER`:$publicPort ..."
+            $testResult = Test-NetConnection -ComputerName $env:BORE_SERVER -Port ([int]$publicPort) -WarningAction SilentlyContinue
+            if ($testResult.TcpTestSucceeded) {
+              Write-Host "Koneksi TCP ke bore.pub berhasil."
+            } else {
+              Write-Host "::warning::Test-NetConnection gagal, tapi port sudah di-assign. Lanjut."
             }
-            Write-Host "Koneksi RDP berhasil!"
           } else {
-            Write-Host "Tes koneksi gagal. Mencoba ulang..."
-            Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+            Write-Host "Gagal mendapatkan port publik dari bore."
+            Write-Host "--- stdout ---"
+            Get-Content "bore_out.txt" -ErrorAction SilentlyContinue
+            Write-Host "--- stderr ---"
+            Get-Content "bore_err.txt" -ErrorAction SilentlyContinue
+            Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
             $retryCount++
             Start-Sleep -Seconds 5
           }
         }
 
         if (-not $success) {
-          Write-Host "::error::Gagal membuat tunnel ngrok setelah $maxRetries percobaan."
+          Write-Host "::error::Gagal membuat tunnel bore setelah $maxRetries percobaan. Server publik mungkin congested."
           exit 1
         }
 
-        "RDP_HOST=$($rdpInfo.Host)" | Out-File -FilePath $env:GITHUB_ENV -Append
-        "RDP_PORT=$($rdpInfo.Port)" | Out-File -FilePath $env:GITHUB_ENV -Append
-        "RDP_FULL_ADDRESS=$($rdpInfo.Host):$($rdpInfo.Port)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+        "RDP_HOST=$env:BORE_SERVER" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "RDP_PORT=$publicPort" | Out-File -FilePath $env:GITHUB_ENV -Append
+        "RDP_FULL_ADDRESS=$env:BORE_SERVER`:$publicPort" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
         Write-Host "::endgroup::"
 
-    - name: Start Ngrok HTTP Tunnel
+    - name: Start bore HTTP Tunnel for File Sharing
       if: ${{ inputs.enable_http_tunnel }}
       id: http_tunnel
       shell: pwsh
       run: |
-        Write-Host "::group::Start Ngrok HTTP Tunnel"
+        Write-Host "::group::Start bore HTTP Tunnel (File Sharing)"
 
         $shareDir = "C:\RDP_Share"
         New-Item -ItemType Directory -Path $shareDir -Force | Out-Null
@@ -327,32 +301,34 @@ jobs:
 
         Write-Host "Membuat HTTP server di port 8080..."
         $pythonProc = Start-Process -FilePath "python" -ArgumentList "-m http.server 8080 --directory `"$shareDir`"" -WindowStyle Hidden -PassThru
-
         Start-Sleep -Seconds 3
 
-        Write-Host "Menambahkan HTTP tunnel via API ngrok..."
-        $body = @{
-          addr = "8080"
-          proto = "http"
-          name = "fileshare"
-        } | ConvertTo-Json
+        Write-Host "Menjalankan bore tunnel untuk port 8080..."
+        $boreHttp = Start-Process -FilePath ".\bore\bore.exe" `
+          -ArgumentList "local 8080 --to $env:BORE_SERVER" `
+          -WindowStyle Hidden -PassThru `
+          -RedirectStandardOutput "bore_http_out.txt" `
+          -RedirectStandardError "bore_http_err.txt"
 
-        try {
-          $null = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -Method Post -Body $body -ContentType "application/json" -ErrorAction Stop
-          Start-Sleep -Seconds 5
+        $httpPort = $null
+        $wait = 0
+        while (-not $httpPort -and $wait -lt 30) {
+          Start-Sleep -Seconds 2
+          $wait += 2
+          $combined = ""
+          if (Test-Path "bore_http_out.txt") { $combined += (Get-Content "bore_http_out.txt" -Raw -ErrorAction SilentlyContinue) }
+          if (Test-Path "bore_http_err.txt") { $combined += (Get-Content "bore_http_err.txt" -Raw -ErrorAction SilentlyContinue) }
+          $m = [regex]::Match($combined, "bore\.pub:(\d+)")
+          if ($m.Success) { $httpPort = $m.Groups[1].Value }
+        }
 
-          $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -ErrorAction Stop
-          $httpUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'http' }).public_url
-
-          if ($httpUrl) {
-            "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
-            "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-            Write-Host "HTTP Tunnel: $httpUrl"
-          } else {
-            Write-Host "::warning::HTTP tunnel tidak bisa dibuat."
-          }
-        } catch {
-          Write-Host "::warning::Gagal membuat HTTP tunnel: $($_.Exception.Message)"
+        if ($httpPort) {
+          $httpUrl = "http://$env:BORE_SERVER`:$httpPort"
+          "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HTTP_TUNNEL_URL=$httpUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "HTTP Tunnel: $httpUrl"
+        } else {
+          Write-Host "::warning::HTTP tunnel tidak bisa dibuat (server congested?)."
         }
 
         Write-Host "::endgroup::"
@@ -363,7 +339,7 @@ jobs:
         Write-Host "::add-mask::$env:RDP_PASS"
         $sep = "=" * 60
         Write-Host $sep
-        Write-Host "  WINDOWS RDP SIAP DIGUNAKAN"
+        Write-Host "  WINDOWS RDP SIAP DIGUNAKAN (via bore.pub)"
         Write-Host $sep
         Write-Host "  Host         : $env:RDP_HOST"
         Write-Host "  Port         : $env:RDP_PORT"
@@ -383,13 +359,14 @@ jobs:
         Write-Host ""
         Write-Host "  Cara connect:"
         Write-Host "     1. Buka Remote Desktop Client (mstsc)"
-        Write-Host "     2. Masukkan: $env:RDP_FULL_ADDRESS"
+        Write-Host "     2. Di field Computer, masukkan: $env:RDP_FULL_ADDRESS"
+        Write-Host "        (atau jalankan: mstsc /v:$env:RDP_FULL_ADDRESS)"
         Write-Host "     3. Login dengan user: $env:RDP_USER"
         Write-Host $sep
 
         $lines = @(
           ("=" * 60),
-          "WINDOWS RDP CONNECTION INFO",
+          "WINDOWS RDP CONNECTION INFO (bore.pub)",
           ("=" * 60),
           "Host         : $env:RDP_HOST",
           "Port         : $env:RDP_PORT",
@@ -408,12 +385,11 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Mengirim notifikasi ke Discord..."
-
         $payload = @{
-          username = "RDP Bot"
+          username = "RDP Bot (bore.pub)"
           embeds = @(
             @{
-              title = "Windows RDP Siap Digunakan"
+              title = "Windows RDP Siap Digunakan (bore.pub)"
               color = 3066993
               fields = @(
                 @{ name = "Host"; value = "$env:RDP_HOST"; inline = $true },
@@ -455,25 +431,36 @@ jobs:
         Write-Host "Berakhir pada: $($endTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 
         while ((Get-Date) -lt $endTime) {
-          $ngrokProcess = Get-Process -Name "ngrok" -ErrorAction SilentlyContinue
+          $boreProcess = Get-Process -Name "bore" -ErrorAction SilentlyContinue
 
-          if (-not $ngrokProcess) {
-            Write-Host "::error::Proses ngrok mati! Mencoba restart..."
+          if (-not $boreProcess) {
+            Write-Host "::warning::Proses bore mati! Mencoba restart..."
 
             try {
-              $ngrokProc = Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -WindowStyle Hidden -PassThru -RedirectStandardOutput "ngrok_recover.txt" -RedirectStandardError "ngrok_recover_err.txt"
+              $boreProc = Start-Process -FilePath ".\bore\bore.exe" `
+                -ArgumentList "local 3389 --to $env:BORE_SERVER" `
+                -WindowStyle Hidden -PassThru `
+                -RedirectStandardOutput "bore_recover_out.txt" `
+                -RedirectStandardError "bore_recover_err.txt"
 
               Start-Sleep -Seconds 15
 
-              if ($ngrokProc.HasExited) {
-                Write-Host "::error::Gagal restart ngrok. Keluar."
+              if ($boreProc.HasExited) {
+                Write-Host "::error::Gagal restart bore. Keluar."
                 exit 1
               }
 
-              Write-Host "Ngrok berhasil di-restart. URL mungkin berubah!"
-              $tunnels = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 10
-              $newUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq 'tcp' }).public_url
-              Write-Host "URL baru: $newUrl"
+              # Parse port baru (bore.pub memberi port random tiap koneksi)
+              $combined = ""
+              if (Test-Path "bore_recover_out.txt") { $combined += (Get-Content "bore_recover_out.txt" -Raw) }
+              if (Test-Path "bore_recover_err.txt") { $combined += (Get-Content "bore_recover_err.txt" -Raw) }
+              $m = [regex]::Match($combined, "bore\.pub:(\d+)")
+              if ($m.Success) {
+                $newPort = $m.Groups[1].Value
+                Write-Host "::warning::Bore di-restart. PORT BARU: $newPort (port lama $env:RDP_PORT tidak valid lagi!)"
+              } else {
+                Write-Host "::warning::Bore di-restart tapi port belum terdeteksi."
+              }
             } catch {
               Write-Host "::error::Restart gagal: $($_.Exception.Message)"
               exit 1
@@ -482,7 +469,7 @@ jobs:
             $remaining = [int](($endTime - (Get-Date)).TotalMinutes)
             $currentStatus = "OK - Sisa: $remaining menit"
             if ($currentStatus -ne $lastStatus) {
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Ngrok berjalan. Sisa waktu: $remaining menit."
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] bore berjalan. Sisa waktu: $remaining menit."
               $lastStatus = $currentStatus
             }
           }
@@ -498,20 +485,19 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "::group::Cleanup"
-
-        Write-Host "Menghentikan proses ngrok..."
-        Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Host "Menghentikan proses bore..."
+        Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
         Write-Host "Menghentikan HTTP server..."
         Get-Process -Name "python" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
         Write-Host "Menghapus file sementara..."
-        Remove-Item "ngrok.zip","ngrok_log.txt","ngrok_err.txt","ngrok_recover.txt","ngrok_recover_err.txt" -Force -ErrorAction SilentlyContinue
-        Remove-Item ".\ngrok" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item "bore.zip","bore_out.txt","bore_err.txt","bore_http_out.txt","bore_http_err.txt","bore_recover_out.txt","bore_recover_err.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item ".\bore" -Recurse -Force -ErrorAction SilentlyContinue
 
         Write-Host "Menghapus firewall rules..."
-        Remove-NetFirewallRule -DisplayName "Allow Ngrok Outbound" -ErrorAction SilentlyContinue
-        Remove-NetFirewallRule -DisplayName "Allow Ngrok Inbound" -ErrorAction SilentlyContinue
+        Remove-NetFirewallRule -DisplayName "Allow bore Outbound" -ErrorAction SilentlyContinue
+        Remove-NetFirewallRule -DisplayName "Allow bore Inbound" -ErrorAction SilentlyContinue
         Remove-NetFirewallRule -DisplayName "Allow RDP 3389" -ErrorAction SilentlyContinue
 
         Write-Host "Cleanup selesai."
