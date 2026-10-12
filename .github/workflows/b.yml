@@ -1,0 +1,364 @@
+name: 📥 Download Coding Models
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: 'Models to download (comma-separated or "all")'
+        type: choice
+        options:
+          - all
+          - qwen3-coder
+          - deepseek-v3
+          - devstral
+          - phi-4
+          - glm-4
+          - codestral
+          - starcoder2
+        default: all
+      quantization:
+        description: 'Quantization level (GGUF only)'
+        type: choice
+        options: [Q4_K_M, Q5_K_M, Q6_K, Q8_0, F16]
+        default: Q4_K_M
+      upload_s3:
+        description: 'Upload to S3 (requires secrets)'
+        type: boolean
+        default: false
+      upload_hf:
+        description: 'Upload to Hugging Face Hub'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 3 * * 0'    # Weekly backup of models
+  workflow_call:
+    inputs:
+      models:
+        type: string
+        default: 'all'
+      quantization:
+        type: string
+        default: 'Q4_K_M'
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  HF_HOME: ${{ github.workspace }}/hf-cache
+  HF_HUB_ENABLE_HF_TRANSFER: '1'
+  MODELS_DIR: ${{ github.workspace }}/models
+
+jobs:
+
+  # ═══════════════════════════════════════════════════
+  # 1. PREPARE MATRIX
+  # ═══════════════════════════════════════════════════
+  prepare:
+    name: 🎯 Prepare Model List
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: 🎯 Build matrix
+        id: set
+        run: |
+          INPUT="${{ inputs.models || 'all' }}"
+
+          if [ "$INPUT" == "all" ]; then
+            MATRIX='{"include":[
+              {"name":"qwen3-coder","repo":"Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF","file":"*Q4_K_M.gguf","size":"~18GB","license":"Apache-2.0"},
+              {"name":"deepseek-v3","repo":"bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF","file":"*Q4_K_M.gguf","size":"~10GB","license":"MIT"},
+              {"name":"devstral","repo":"mistralai/Devstral-Small-2507","file":"*","size":"~14GB","license":"Apache-2.0"},
+              {"name":"phi-4","repo":"microsoft/phi-4-gguf","file":"*Q4_K_M.gguf","size":"~9GB","license":"MIT"},
+              {"name":"glm-4","repo":"THUDM/glm-4-9b-chat-1m","file":"*","size":"~18GB","license":"Apache-2.0"},
+              {"name":"codestral","repo":"mistralai/Codestral-22B-v0.1","file":"*","size":"~44GB","license":"Apache-2.0"}
+            ]}'
+          else
+            case "$INPUT" in
+              qwen3-coder)  MATRIX='{"include":[{"name":"qwen3-coder","repo":"Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF","file":"*Q4_K_M.gguf","size":"~18GB","license":"Apache-2.0"}]}' ;;
+              deepseek-v3)  MATRIX='{"include":[{"name":"deepseek-v3","repo":"bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF","file":"*Q4_K_M.gguf","size":"~10GB","license":"MIT"}]}' ;;
+              devstral)     MATRIX='{"include":[{"name":"devstral","repo":"mistralai/Devstral-Small-2507","file":"*","size":"~14GB","license":"Apache-2.0"}]}' ;;
+              phi-4)        MATRIX='{"include":[{"name":"phi-4","repo":"microsoft/phi-4-gguf","file":"*Q4_K_M.gguf","size":"~9GB","license":"MIT"}]}' ;;
+              glm-4)        MATRIX='{"include":[{"name":"glm-4","repo":"THUDM/glm-4-9b-chat-1m","file":"*","size":"~18GB","license":"Apache-2.0"}]}' ;;
+              codestral)    MATRIX='{"include":[{"name":"codestral","repo":"mistralai/Codestral-22B-v0.1","file":"*","size":"~44GB","license":"Apache-2.0"}]}' ;;
+              starcoder2)   MATRIX='{"include":[{"name":"starcoder2","repo":"bigcode/starcoder2-15b-instruct-v0.1","file":"*","size":"~30GB","license":"BigCode-OpenRAIL-M"}]}' ;;
+              *)            MATRIX='{"include":[]}' ;;
+            esac
+          fi
+
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "### 🎯 Models to download" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          echo "$MATRIX" | jq . >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ═══════════════════════════════════════════════════
+  # 2. DOWNLOAD MODELS (Matrix Parallel)
+  # ═══════════════════════════════════════════════════
+  download:
+    name: 📥 Download ${{ matrix.name }}
+    needs: [prepare]
+    if: needs.prepare.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360    # 6 jam max
+    strategy:
+      fail-fast: false      # ⚠️ Jangan stop model lain jika 1 gagal
+      max-parallel: 3       # Batasi bandwidth
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 📦 Install tools
+        run: |
+          pip install --upgrade pip
+          pip install "huggingface_hub[cli,hf_transfer]" hf-transfer
+          sudo apt-get update && sudo apt-get install -y aria2 jq
+
+      - name: 💾 Restore cache
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.MODELS_DIR }}/${{ matrix.name }}
+          key: model-${{ matrix.name }}-${{ inputs.quantization || 'Q4_K_M' }}-v1
+          restore-keys: |
+            model-${{ matrix.name }}-
+
+      - name: 🚦 Skip if cached
+        id: check
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" == "true" ]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "✅ Using cached model"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 📥 Download with HF CLI
+        if: steps.check.outputs.skip != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_ENABLE_HF_TRANSFER: '1'
+        run: |
+          mkdir -p "${{ env.MODELS_DIR }}/${{ matrix.name }}"
+
+          echo "📥 Downloading ${{ matrix.repo }} ..."
+          echo "📁 Target: ${{ env.MODELS_DIR }}/${{ matrix.name }}"
+          echo "📊 Estimated size: ${{ matrix.size }}"
+
+          # Primary: HF CLI
+          hf download ${{ matrix.repo }} \
+            --local-dir "${{ env.MODELS_DIR }}/${{ matrix.name }}" \
+            --include "${{ matrix.file }}" \
+            --max-workers 4 \
+            || echo "⚠️ HF CLI partial, trying fallback..."
+
+      - name: 📥 Fallback with aria2
+        if: |
+          steps.check.outputs.skip != 'true' &&
+          failure()
+        run: |
+          echo "🔄 Fallback: aria2 multi-connection download"
+          mkdir -p "${{ env.MODELS_DIR }}/${{ matrix.name }}"
+
+          # Get file list via HF API
+          curl -s "https://huggingface.co/api/models/${{ matrix.repo }}" \
+            | jq -r '.siblings[].rfilename' \
+            | while read file; do
+                if [[ "$file" == *"${{ inputs.quantization }}"* ]] || [[ "${{ matrix.file }}" == "*" ]]; then
+                  URL="https://huggingface.co/${{ matrix.repo }}/resolve/main/${file}"
+                  OUT="${{ env.MODELS_DIR }}/${{ matrix.name }}/$(basename "$file")"
+                  echo "⬇️ $file"
+                  aria2c -x 8 -s 8 -k 1M -d "$(dirname "$OUT")" -o "$(basename "$OUT")" "$URL" || true
+                fi
+              done
+        continue-on-error: true
+
+      - name: ✅ Verify download
+        if: steps.check.outputs.skip != 'true'
+        id: verify
+        run: |
+          DIR="${{ env.MODELS_DIR }}/${{ matrix.name }}"
+          SIZE=$(du -sb "$DIR" 2>/dev/null | cut -f1 || echo 0)
+          FILES=$(find "$DIR" -type f | wc -l)
+
+          echo "📊 Size: $(numfmt --to=iec $SIZE)"
+          echo "📁 Files: $FILES"
+
+          # Validasi minimum
+          if [ "$FILES" -lt 1 ]; then
+            echo "::error::No files downloaded"
+            exit 1
+          fi
+
+          # Generate manifest
+          cat > "$DIR/manifest.json" <<EOF
+          {
+            "model": "${{ matrix.name }}",
+            "repo": "${{ matrix.repo }}",
+            "file_pattern": "${{ matrix.file }}",
+            "license": "${{ matrix.license }}",
+            "size_bytes": $SIZE,
+            "file_count": $FILES,
+            "downloaded_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "quantization": "${{ inputs.quantization || 'Q4_K_M' }}",
+            "sha": "${{ github.sha }}"
+          }
+          EOF
+
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+
+      - name: 🔐 Generate checksums
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          DIR="${{ env.MODELS_DIR }}/${{ matrix.name }}"
+          find "$DIR" -type f -name "*.gguf" -o -name "*.safetensors" -o -name "*.bin" \
+            | xargs -r sha256sum > "$DIR/SHA256SUMS.txt"
+          cat "$DIR/SHA256SUMS.txt"
+
+      - name: 💾 Save to cache
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.MODELS_DIR }}/${{ matrix.name }}
+          key: model-${{ matrix.name }}-${{ inputs.quantization || 'Q4_K_M' }}-v1
+
+      - name: 📤 Upload artifact (7 days)
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ matrix.name }}-${{ inputs.quantization || 'Q4_K_M' }}
+          path: ${{ env.MODELS_DIR }}/${{ matrix.name }}
+          retention-days: 7
+          compression-level: 0    # ⚠️ Sudah terkompresi (GGUF)
+
+      - name: 📊 Summary
+        run: |
+          {
+            echo "### ✅ ${{ matrix.name }}"
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Repo | \`${{ matrix.repo }}\` |"
+            echo "| Size | ${{ steps.verify.outputs.size }} bytes |"
+            echo "| Files | ${{ steps.verify.outputs.files }} |"
+            echo "| License | ${{ matrix.license }} |"
+            echo "| Quantization | ${{ inputs.quantization || 'Q4_K_M' }} |"
+          } >> $GITHUB_STEP_SUMMARY
+
+  # ═══════════════════════════════════════════════════
+  # 3. UPLOAD TO S3 (optional)
+  # ═══════════════════════════════════════════════════
+  upload-s3:
+    name: ☁️ Upload to S3
+    needs: [download]
+    if: |
+      always() &&
+      inputs.upload_s3 == true &&
+      needs.download.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: model-*
+          merge-multiple: false
+          path: models/
+
+      - name: 🔐 Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: ☁️ Sync to S3
+        run: |
+          aws s3 sync models/ s3://${{ secrets.S3_BUCKET }}/models/ \
+            --storage-class INTELLIGENT_TIERING \
+            --no-progress
+
+      - name: 📊 S3 summary
+        run: |
+          aws s3 ls --recursive s3://${{ secrets.S3_BUCKET }}/models/ \
+            | head -50
+
+  # ═══════════════════════════════════════════════════
+  # 4. UPLOAD TO HUGGING FACE (optional)
+  # ═══════════════════════════════════════════════════
+  upload-hf:
+    name: 🤗 Upload to HF Hub
+    needs: [download]
+    if: |
+      always() &&
+      inputs.upload_hf == true &&
+      needs.download.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: model-*
+          path: models/
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - run: pip install huggingface_hub
+
+      - name: 🤗 Upload
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          from pathlib import Path
+          from huggingface_hub import HfApi
+
+          api = HfApi()
+          repo = os.environ["HF_REPO_ID"]
+          api.create_repo(repo_id=repo, repo_type="model", exist_ok=True, private=True)
+
+          for model_dir in Path("models").iterdir():
+              if model_dir.is_dir():
+                  print(f"Uploading {model_dir.name}...")
+                  api.upload_folder(
+                      folder_path=str(model_dir),
+                      repo_id=repo,
+                      repo_type="model",
+                      path_in_repo=model_dir.name,
+                  )
+          EOF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+
+  # ═══════════════════════════════════════════════════
+  # 5. FINAL REPORT
+  # ═══════════════════════════════════════════════════
+  report:
+    name: 📊 Final Report
+    needs: [prepare, download]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📊 Report
+        run: |
+          {
+            echo "# 📥 Coding Models Download Report"
+            echo ""
+            echo "**Status:** ${{ needs.download.result }}"
+            echo "**Trigger:** ${{ github.event_name }}"
+            echo "**Actor:** @${{ github.actor }}"
+            echo ""
+            echo "## Models"
+            echo "| Model | Status | Cache |"
+            echo "|-------|--------|-------|"
+            echo "${{ join(fromJson(needs.prepare.outputs.matrix).include, '\n') }}" | head -1
+          } >> $GITHUB_STEP_SUMMARY
