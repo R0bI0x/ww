@@ -1,0 +1,84 @@
+name: OpenAI-Compatible API
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model Ollama (qwen2.5:7b / mistral:7b / llama3.1:8b / deepseek-coder:6.7b)"
+        type: string
+        default: "qwen2.5:7b"
+  schedule:
+    - cron: "0 */5 * * *"
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DEFAULT_MODEL: ${{ github.event.inputs.model || 'qwen2.5:7b' }}
+      OLLAMA_URL: http://127.0.0.1:11434
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          sudo rm -rf /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r server/requirements.txt
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama & pull model
+        run: |
+          ollama serve > ollama.log 2>&1 &
+          sleep 8
+          echo "⏳ Pull $DEFAULT_MODEL ..."
+          ollama pull "$DEFAULT_MODEL"
+          ollama list
+
+      - name: Start OpenAI-compatible server
+        run: |
+          uvicorn server.main:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
+          sleep 3
+          curl -s http://127.0.0.1:8000/v1/models | head -c 500
+
+      - name: Install cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Open tunnel & print base URL
+        run: |
+          ./cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate > tunnel.log 2>&1 &
+          sleep 15
+          URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -n1)
+          echo ""
+          echo "=================================================="
+          echo "  🔗 BASE_URL   : $URL/v1"
+          echo "  🤖 MODELS     : GET  $URL/v1/models"
+          echo "  💬 CHAT       : POST $URL/v1/chat/completions"
+          echo "  🧠 MODEL      : $DEFAULT_MODEL"
+          echo "  🔓 API KEY    : (bebas / kosong)"
+          echo "=================================================="
+          echo ""
+          echo "Test dengan curl:"
+          echo "curl $URL/v1/chat/completions -H 'Content-Type: application/json' \\"
+          echo "  -d '{\"model\":\"$DEFAULT_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Halo\"}]}'"
+
+      - name: Keep alive
+        run: |
+          for i in $(seq 1 340); do
+            sleep 60
+            echo "[$i min] alive — $DEFAULT_MODEL"
+          done
